@@ -17,6 +17,13 @@ import {
 	highlightCode,
 } from "@earendil-works/pi-coding-agent";
 import { createRemotePathMapper, VIRTUAL_ROOT } from "./path-mapping.js";
+import {
+	WINDOWS_PLATFORM_MARKER,
+	WINDOWS_PLATFORM_PROBE,
+	WINDOWS_POWERSHELL_COMMAND,
+	createSshArgs,
+	normalizePowerShellInput,
+} from "./ssh-command.js";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 
@@ -133,7 +140,7 @@ function inferImageMimeType(path: string): string | null {
 
 function sshExec(remote: string, command: string, options: SshExecOptions = {}) {
 	return new Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null }>((resolve, reject) => {
-		const child = spawn("ssh", [remote, command], { stdio: ["pipe", "pipe", "pipe"] });
+		const child = spawn("ssh", createSshArgs(remote, command), { stdio: ["pipe", "pipe", "pipe"] });
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		let timedOut = false;
@@ -207,18 +214,49 @@ async function sshOk(remote: string, command: string, options: SshExecOptions = 
 	return stdout;
 }
 
+function sshPowerShellExec(
+	remote: string,
+	script: string,
+	options: Omit<SshExecOptions, "stdin"> = {},
+) {
+	return sshExec(remote, WINDOWS_POWERSHELL_COMMAND, {
+		...options,
+		stdin: normalizePowerShellInput(script),
+	});
+}
+
+async function sshPowerShellOk(
+	remote: string,
+	script: string,
+	options: Omit<SshExecOptions, "stdin"> = {},
+): Promise<Buffer> {
+	const { stdout, stderr, exitCode } = await sshPowerShellExec(remote, script, options);
+	if (exitCode !== 0) {
+		const errorText = stderr.toString("utf8").trim() || stdout.toString("utf8").trim() || "unknown ssh error";
+		throw new Error(`SSH failed (${exitCode}): ${errorText}`);
+	}
+	return stdout;
+}
+
 async function detectRemotePlatform(remote: string): Promise<RemotePlatform> {
 	try {
-		const stdout = await sshOk(
-			remote,
-			"if ($PSVersionTable) { Write-Output '__PI_SSH_PLATFORM=windows-powershell__' }",
-			{ timeoutSeconds: 5 },
-		);
-		if (stdout.toString("utf8").includes("__PI_SSH_PLATFORM=windows-powershell__")) {
+		const stdout = await sshOk(remote, WINDOWS_PLATFORM_PROBE, { timeoutSeconds: 5 });
+		if (stdout.toString("utf8").includes(WINDOWS_PLATFORM_MARKER)) {
 			return "windows-powershell";
 		}
 	} catch {
-		// Not PowerShell, or the remote rejected the probe. Try POSIX next.
+		// The default shell may not be Windows. Try an explicit PowerShell probe before POSIX.
+	}
+
+	try {
+		const stdout = await sshPowerShellOk(remote, `Write-Output '${WINDOWS_PLATFORM_MARKER}'`, {
+			timeoutSeconds: 5,
+		});
+		if (stdout.toString("utf8").includes(WINDOWS_PLATFORM_MARKER)) {
+			return "windows-powershell";
+		}
+	} catch {
+		// Not a Windows target with PowerShell available. Try POSIX next.
 	}
 
 	try {
@@ -241,9 +279,14 @@ async function resolveRemoteLocation(
 	profile: SshProfile,
 	platform: RemotePlatform,
 ): Promise<{ remoteCwd: string; remoteHome: string }> {
-	const remoteHome = lastNonEmptyLine(
-		(await sshOk(profile.remote, platform === "windows-powershell" ? "$HOME" : `printf '%s' "$HOME"`)).toString("utf8"),
-	);
+	const remoteHomeCommand =
+		platform === "windows-powershell" ? "[Environment]::GetFolderPath('UserProfile')" : `printf '%s' "$HOME"`;
+	const remoteHomeOutput =
+		platform === "windows-powershell"
+			? await sshPowerShellOk(profile.remote, remoteHomeCommand)
+			: await sshOk(profile.remote, remoteHomeCommand);
+	const remoteHome = lastNonEmptyLine(remoteHomeOutput.toString("utf8"));
+
 	const remoteCwdCommand =
 		platform === "windows-powershell"
 			? profile.cwd?.trim()
@@ -252,7 +295,11 @@ async function resolveRemoteLocation(
 			: profile.cwd?.trim()
 				? `cd -- ${shellQuote(profile.cwd.trim())} && pwd`
 				: "pwd";
-	const remoteCwd = lastNonEmptyLine((await sshOk(profile.remote, remoteCwdCommand)).toString("utf8"));
+	const remoteCwdOutput =
+		platform === "windows-powershell"
+			? await sshPowerShellOk(profile.remote, remoteCwdCommand)
+			: await sshOk(profile.remote, remoteCwdCommand);
+	const remoteCwd = lastNonEmptyLine(remoteCwdOutput.toString("utf8"));
 	if (!remoteCwd) throw new Error("Could not determine the remote working directory");
 	return { remoteCwd, remoteHome };
 }
@@ -274,7 +321,7 @@ function createRemoteReadOps(target: ActiveSshTarget, pathMapper: RemotePathMapp
 		readFile: (absolutePath) => {
 			const remotePath = pathMapper.toRemotePath(absolutePath);
 			if (target.platform === "windows-powershell") {
-				return sshOk(
+				return sshPowerShellOk(
 					target.remote,
 					`$p=${powershellQuote(remotePath)}; $bytes=[System.IO.File]::ReadAllBytes($p); [Console]::OpenStandardOutput().Write($bytes,0,$bytes.Length)`,
 				);
@@ -284,7 +331,7 @@ function createRemoteReadOps(target: ActiveSshTarget, pathMapper: RemotePathMapp
 		access: (absolutePath) => {
 			const remotePath = pathMapper.toRemotePath(absolutePath);
 			if (target.platform === "windows-powershell") {
-				return sshOk(
+				return sshPowerShellOk(
 					target.remote,
 					`if (-not (Test-Path -LiteralPath ${powershellQuote(remotePath)} -PathType Leaf)) { exit 1 }`,
 				).then(() => {});
@@ -301,11 +348,14 @@ function createRemoteWriteOps(target: ActiveSshTarget, pathMapper: RemotePathMap
 			const remotePath = pathMapper.toRemotePath(absolutePath);
 			if (target.platform === "windows-powershell") {
 				const base64Content = Buffer.from(content, "utf8").toString("base64");
-				await sshOk(
-					target.remote,
-					`$p=${powershellQuote(remotePath)}; $dir=Split-Path -Parent $p; if ($dir) { [System.IO.Directory]::CreateDirectory($dir) | Out-Null }; $b64=[Console]::In.ReadToEnd(); $bytes=[Convert]::FromBase64String($b64); [System.IO.File]::WriteAllBytes($p,$bytes)`,
-					{ stdin: base64Content },
-				);
+				const script = [
+					`$p=${powershellQuote(remotePath)}`,
+					`$dir=Split-Path -Parent $p; if ($dir) { [System.IO.Directory]::CreateDirectory($dir) | Out-Null }`,
+					`$b64=${powershellQuote(base64Content)}`,
+					`$bytes=[Convert]::FromBase64String($b64)`,
+					`[System.IO.File]::WriteAllBytes($p,$bytes)`,
+				].join("\n");
+				await sshPowerShellOk(target.remote, script);
 				return;
 			}
 			await sshOk(target.remote, `cat > ${shellQuote(remotePath)}`, { stdin: content });
@@ -313,7 +363,7 @@ function createRemoteWriteOps(target: ActiveSshTarget, pathMapper: RemotePathMap
 		mkdir: (dir) => {
 			const remoteDir = pathMapper.toRemotePath(dir);
 			if (target.platform === "windows-powershell") {
-				return sshOk(
+				return sshPowerShellOk(
 					target.remote,
 					`[System.IO.Directory]::CreateDirectory(${powershellQuote(remoteDir)}) | Out-Null`,
 				).then(() => {});
@@ -332,7 +382,7 @@ function createRemoteEditOps(target: ActiveSshTarget, pathMapper: RemotePathMapp
 		access: (absolutePath) => {
 			const remotePath = pathMapper.toRemotePath(absolutePath);
 			if (target.platform === "windows-powershell") {
-				return sshOk(
+				return sshPowerShellOk(
 					target.remote,
 					`if (-not (Test-Path -LiteralPath ${powershellQuote(remotePath)} -PathType Leaf)) { exit 1 }; $item=Get-Item -LiteralPath ${powershellQuote(remotePath)}; if ($item.IsReadOnly) { exit 1 }`,
 				).then(() => {});
@@ -350,7 +400,7 @@ function createRemoteBashOps(target: ActiveSshTarget): BashOperations {
 			if (target.platform === "windows-powershell") {
 				const remoteCwd = cwd;
 				const script = `Set-Location -LiteralPath ${powershellQuote(remoteCwd)}\n${command}\nif ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE } else { exit 0 }\n`;
-				const { exitCode } = await sshExec(target.remote, script, {
+				const { exitCode } = await sshPowerShellExec(target.remote, script, {
 					signal,
 					timeoutSeconds: timeout,
 					onStdoutData: onData,

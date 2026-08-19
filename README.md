@@ -94,7 +94,7 @@ The picker reads `Host ...` aliases from your local `~/.ssh/config`.
 
 - wildcard entries like `Host *` are ignored
 - aliases are used as the SSH target directly
-- if no remote path is provided, the extension resolves it with `ssh <host> pwd`
+- if no remote path is provided, the extension resolves it with a platform-specific SSH probe (`pwd` on POSIX or PowerShell `Get-Location` on Windows)
 
 This is mainly a convenience layer. SSH config is not required for the actual remote tools.
 
@@ -104,13 +104,14 @@ This is mainly a convenience layer. SSH config is not required for the actual re
 - local `ssh` client available in `$PATH`
 - key-based auth or another non-interactive SSH setup
 - POSIX targets: `bash` available on the remote host
-- Windows targets: OpenSSH default command shell is PowerShell Core-compatible
+- Windows targets: `powershell.exe` is available on the remote host; the OpenSSH default shell may be `cmd.exe` or PowerShell
 
 ## Notes
 
-- `ssh_activate` probes the remote command shell and records `platform: posix` or `platform: windows-powershell`
+- `ssh_activate` probes the remote command shell and records `platform: posix` or `platform: windows-powershell`; Windows detection uses `cmd.exe`/explicit PowerShell probes instead of running POSIX utilities first
+- Programmatic SSH calls disable X11 forwarding, so a local `ForwardX11 yes` setting does not break non-GUI remote commands
 - POSIX targets keep the historical `bash`/`cat`/`test`/`mkdir` backend
-- Windows PowerShell targets use `(Get-Location).Path`, `Test-Path`, .NET file APIs, and PowerShell `Set-Location -LiteralPath` so OpenSSH servers with PowerShell Core default shells work without `exec bash`
+- Windows PowerShell targets run through an explicit noninteractive `powershell.exe` stdin script and use `(Get-Location).Path`, `Test-Path`, .NET file APIs, and PowerShell `Set-Location -LiteralPath`; this works even when the OpenSSH default shell is `cmd.exe`
 - `ssh_write` writes file content over stdin, which behaves better than GNU-specific `base64 -d` shell snippets and also avoids command-line length limits on Windows
 - relative remote paths resolve against the active remote cwd
 - remote POSIX and Windows paths are normalized before Pi's local path resolver runs, so Windows control clients can safely address macOS/Linux paths such as `/Users/me/project/file.txt`
