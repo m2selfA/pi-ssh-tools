@@ -16,6 +16,7 @@ import {
 	type WriteOperations,
 	highlightCode,
 } from "@earendil-works/pi-coding-agent";
+import { createRemotePathMapper } from "./path-mapping.js";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 
@@ -31,7 +32,13 @@ type ActiveSshTarget = {
 	name: string;
 	remote: string;
 	remoteCwd: string;
+	remoteHome: string;
 	platform: RemotePlatform;
+};
+
+type RemotePathMapper = {
+	toCorePath: (inputPath: string) => string;
+	toRemotePath: (absolutePath: string) => string;
 };
 
 type SshExecOptions = {
@@ -54,26 +61,8 @@ function powershellQuote(value: string): string {
 	return `'${value.replaceAll("'", "''")}'`;
 }
 
-function normalizeWindowsPathForRemote(absolutePath: string, remoteCwd: string): string {
-	const withoutSyntheticSlash = absolutePath.replace(/^\/([A-Za-z]:[\\/].*)$/, "$1");
-	if (/^[A-Za-z]:[\\/]/.test(withoutSyntheticSlash) || withoutSyntheticSlash.startsWith("\\\\")) {
-		return withoutSyntheticSlash.replaceAll("\\", "/");
-	}
-	if (withoutSyntheticSlash === "/") {
-		return remoteCwd.replaceAll("\\", "/");
-	}
-	if (withoutSyntheticSlash.startsWith("/")) {
-		const relative = withoutSyntheticSlash.slice(1);
-		const base = remoteCwd.replaceAll("\\", "/").replace(/\/+$/, "");
-		return relative ? `${base}/${relative}` : base;
-	}
-	return withoutSyntheticSlash.replaceAll("\\", "/");
-}
-
-function toRemotePath(target: ActiveSshTarget, absolutePath: string): string {
-	return target.platform === "windows-powershell"
-		? normalizeWindowsPathForRemote(absolutePath, target.remoteCwd)
-		: absolutePath;
+function lastNonEmptyLine(value: string): string {
+	return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop() ?? "";
 }
 
 function parseSshConfigProfiles(): SshProfile[] {
@@ -248,30 +237,40 @@ async function detectRemotePlatform(remote: string): Promise<RemotePlatform> {
 	return "posix";
 }
 
-async function resolveRemoteCwd(profile: SshProfile, platform: RemotePlatform): Promise<string> {
-	if (profile.cwd?.trim()) {
-		return profile.cwd.trim();
-	}
-	if (platform === "windows-powershell") {
-		return (await sshOk(profile.remote, "(Get-Location).Path")).toString("utf8").trim();
-	}
-	return (await sshOk(profile.remote, "pwd")).toString("utf8").trim();
+async function resolveRemoteLocation(
+	profile: SshProfile,
+	platform: RemotePlatform,
+): Promise<{ remoteCwd: string; remoteHome: string }> {
+	const remoteHome = lastNonEmptyLine(
+		(await sshOk(profile.remote, platform === "windows-powershell" ? "$HOME" : `printf '%s' "$HOME"`)).toString("utf8"),
+	);
+	const remoteCwdCommand =
+		platform === "windows-powershell"
+			? profile.cwd?.trim()
+				? `Set-Location -LiteralPath ${powershellQuote(profile.cwd.trim())}; (Get-Location).Path`
+				: "(Get-Location).Path"
+			: profile.cwd?.trim()
+				? `cd -- ${shellQuote(profile.cwd.trim())} && pwd`
+				: "pwd";
+	const remoteCwd = lastNonEmptyLine((await sshOk(profile.remote, remoteCwdCommand)).toString("utf8"));
+	if (!remoteCwd) throw new Error("Could not determine the remote working directory");
+	return { remoteCwd, remoteHome };
 }
 
-function createRemoteReadOps(target: ActiveSshTarget): ReadOperations {
+function createRemoteReadOps(target: ActiveSshTarget, pathMapper: RemotePathMapper): ReadOperations {
 	return {
 		readFile: (absolutePath) => {
-			const remotePath = toRemotePath(target, absolutePath);
+			const remotePath = pathMapper.toRemotePath(absolutePath);
 			if (target.platform === "windows-powershell") {
 				return sshOk(
 					target.remote,
 					`$p=${powershellQuote(remotePath)}; $bytes=[System.IO.File]::ReadAllBytes($p); [Console]::OpenStandardOutput().Write($bytes,0,$bytes.Length)`,
 				);
 			}
-			return sshOk(target.remote, `cat ${shellQuote(remotePath)}`);
+			return sshOk(target.remote, `cat -- ${shellQuote(remotePath)}`);
 		},
 		access: (absolutePath) => {
-			const remotePath = toRemotePath(target, absolutePath);
+			const remotePath = pathMapper.toRemotePath(absolutePath);
 			if (target.platform === "windows-powershell") {
 				return sshOk(
 					target.remote,
@@ -280,14 +279,14 @@ function createRemoteReadOps(target: ActiveSshTarget): ReadOperations {
 			}
 			return sshOk(target.remote, `test -r ${shellQuote(remotePath)}`).then(() => {});
 		},
-		detectImageMimeType: async (absolutePath) => inferImageMimeType(absolutePath),
+		detectImageMimeType: async (absolutePath) => inferImageMimeType(pathMapper.toRemotePath(absolutePath)),
 	};
 }
 
-function createRemoteWriteOps(target: ActiveSshTarget): WriteOperations {
+function createRemoteWriteOps(target: ActiveSshTarget, pathMapper: RemotePathMapper): WriteOperations {
 	return {
 		writeFile: async (absolutePath, content) => {
-			const remotePath = toRemotePath(target, absolutePath);
+			const remotePath = pathMapper.toRemotePath(absolutePath);
 			if (target.platform === "windows-powershell") {
 				const base64Content = Buffer.from(content, "utf8").toString("base64");
 				await sshOk(
@@ -300,26 +299,26 @@ function createRemoteWriteOps(target: ActiveSshTarget): WriteOperations {
 			await sshOk(target.remote, `cat > ${shellQuote(remotePath)}`, { stdin: content });
 		},
 		mkdir: (dir) => {
-			const remoteDir = toRemotePath(target, dir);
+			const remoteDir = pathMapper.toRemotePath(dir);
 			if (target.platform === "windows-powershell") {
 				return sshOk(
 					target.remote,
 					`[System.IO.Directory]::CreateDirectory(${powershellQuote(remoteDir)}) | Out-Null`,
 				).then(() => {});
 			}
-			return sshOk(target.remote, `mkdir -p ${shellQuote(remoteDir)}`).then(() => {});
+			return sshOk(target.remote, `mkdir -p -- ${shellQuote(remoteDir)}`).then(() => {});
 		},
 	};
 }
 
-function createRemoteEditOps(target: ActiveSshTarget): EditOperations {
-	const readOps = createRemoteReadOps(target);
-	const writeOps = createRemoteWriteOps(target);
+function createRemoteEditOps(target: ActiveSshTarget, pathMapper: RemotePathMapper): EditOperations {
+	const readOps = createRemoteReadOps(target, pathMapper);
+	const writeOps = createRemoteWriteOps(target, pathMapper);
 	return {
 		readFile: readOps.readFile,
 		writeFile: writeOps.writeFile,
 		access: (absolutePath) => {
-			const remotePath = toRemotePath(target, absolutePath);
+			const remotePath = pathMapper.toRemotePath(absolutePath);
 			if (target.platform === "windows-powershell") {
 				return sshOk(
 					target.remote,
@@ -337,7 +336,7 @@ function createRemoteBashOps(target: ActiveSshTarget): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout }) => {
 			if (target.platform === "windows-powershell") {
-				const remoteCwd = toRemotePath(target, cwd);
+				const remoteCwd = cwd;
 				const script = `Set-Location -LiteralPath ${powershellQuote(remoteCwd)}\n${command}\nif ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE } else { exit 0 }\n`;
 				const { exitCode } = await sshExec(target.remote, script, {
 					signal,
@@ -369,20 +368,14 @@ function enableSshTools(pi: ExtensionAPI) {
 	pi.setActiveTools(Array.from(next));
 }
 
-function toolCwdForTarget(target: ActiveSshTarget): string {
-	// Pi's built-in path resolver uses the local Node platform. On Linux/macOS it
-	// does not recognize Windows drive paths as absolute, so use / as a neutral
-	// synthetic cwd and map /foo back to <remoteCwd>/foo inside operations.
-	return target.platform === "windows-powershell" ? "/" : target.remoteCwd;
-}
-
 export default function sshToolsExtension(pi: ExtensionAPI) {
 	let activeTarget: ActiveSshTarget | null = null;
+	const localCwd = process.cwd();
 
-	const readBase = createReadToolDefinition("/");
-	const writeBase = createWriteToolDefinition("/");
-	const editBase = createEditToolDefinition("/");
-	const bashBase = createBashToolDefinition("/");
+	const readBase = createReadToolDefinition(localCwd);
+	const writeBase = createWriteToolDefinition(localCwd);
+	const editBase = createEditToolDefinition(localCwd);
+	const bashBase = createBashToolDefinition(localCwd);
 
 	const requireActiveTarget = (): ActiveSshTarget => {
 		if (!activeTarget) {
@@ -406,8 +399,14 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 
 	const activate = async (profile: SshProfile, ctx: ExtensionContext | ExtensionCommandContext, notify = true) => {
 		const platform = await detectRemotePlatform(profile.remote);
-		const remoteCwd = await resolveRemoteCwd(profile, platform);
-		activeTarget = { name: profile.name, remote: profile.remote, remoteCwd, platform };
+		const activatedLocation = await resolveRemoteLocation(profile, platform);
+		activeTarget = {
+			name: profile.name,
+			remote: profile.remote,
+			remoteCwd: activatedLocation.remoteCwd,
+			remoteHome: activatedLocation.remoteHome,
+			platform,
+		};
 		enableSshTools(pi);
 		updateStatus(ctx);
 		if (notify && ctx.hasUI) {
@@ -513,8 +512,10 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		parameters: readBase.parameters,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
-			const tool = createReadToolDefinition(toolCwdForTarget(target), { operations: createRemoteReadOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate, ctx);
+			const pathMapper = createRemotePathMapper(localCwd, target.remoteCwd, target.remoteHome, target.platform);
+			const tool = createReadToolDefinition(localCwd, { operations: createRemoteReadOps(target, pathMapper) });
+			const transformedParams = { ...params, path: pathMapper.toCorePath(params.path) };
+			return tool.execute(toolCallId, transformedParams, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
@@ -537,8 +538,10 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		parameters: writeBase.parameters,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
-			const tool = createWriteToolDefinition(toolCwdForTarget(target), { operations: createRemoteWriteOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate, ctx);
+			const pathMapper = createRemotePathMapper(localCwd, target.remoteCwd, target.remoteHome, target.platform);
+			const tool = createWriteToolDefinition(localCwd, { operations: createRemoteWriteOps(target, pathMapper) });
+			const transformedParams = { ...params, path: pathMapper.toCorePath(params.path) };
+			return tool.execute(toolCallId, transformedParams, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
@@ -565,8 +568,10 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		prepareArguments: editBase.prepareArguments,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
-			const tool = createEditToolDefinition(toolCwdForTarget(target), { operations: createRemoteEditOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate, ctx);
+			const pathMapper = createRemotePathMapper(localCwd, target.remoteCwd, target.remoteHome, target.platform);
+			const tool = createEditToolDefinition(localCwd, { operations: createRemoteEditOps(target, pathMapper) });
+			const transformedParams = { ...params, path: pathMapper.toCorePath(params.path) };
+			return tool.execute(toolCallId, transformedParams, signal, onUpdate, ctx);
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";

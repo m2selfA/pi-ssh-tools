@@ -24,3 +24,5 @@ The package history was extracted from the upstream monorepo path `packages/pi-s
   - `ssh_status({})`
   - `ssh_deactivate({})`
 - Updated `ssh_bash.renderCall` to render the active target and bash-highlight the exact command while keeping built-in bash output rendering.
+- Added cross-platform remote path mapping for `ssh_read`, `ssh_write`, and `ssh_edit`, plus consistent remote cwd handling for `ssh_bash`; this covers Windows controller to POSIX remote paths and remote home expansion.
+- Added path-mapping regression tests and bumped the package to `0.1.5-hackxit.2`.

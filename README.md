@@ -113,9 +113,20 @@ This is mainly a convenience layer. SSH config is not required for the actual re
 - Windows PowerShell targets use `(Get-Location).Path`, `Test-Path`, .NET file APIs, and PowerShell `Set-Location -LiteralPath` so OpenSSH servers with PowerShell Core default shells work without `exec bash`
 - `ssh_write` writes file content over stdin, which behaves better than GNU-specific `base64 -d` shell snippets and also avoids command-line length limits on Windows
 - relative remote paths resolve against the active remote cwd
+- remote POSIX and Windows paths are normalized before Pi's local path resolver runs, so Windows control clients can safely address macOS/Linux paths such as `/Users/me/project/file.txt`
+- absolute paths outside the active remote cwd are carried through an internal virtual path and still execute on the remote host
+- remote `~` paths resolve against the detected remote home directory
 - image reads are supported for common extensions: jpg, jpeg, png, gif, webp
 - `ssh_bash` renders the target and the exact command in the TUI; on POSIX targets command text is bash-highlighted, and on Windows targets the command still renders in the same compact shell block while the prompt/system guidance tells agents to use PowerShell syntax
 
-## License
+## Development
 
-MIT
+Run the path-mapping regression tests with:
+
+```bash
+npm test
+```
+
+The tests cover Windows-to-POSIX absolute paths, relative paths, traversal, remote home expansion, virtual-path collisions, and Windows PowerShell targets.
+
+
