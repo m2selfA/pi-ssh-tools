@@ -16,7 +16,7 @@ import {
 	type WriteOperations,
 	highlightCode,
 } from "@earendil-works/pi-coding-agent";
-import { createRemotePathMapper } from "./path-mapping.js";
+import { createRemotePathMapper, VIRTUAL_ROOT } from "./path-mapping.js";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 
@@ -255,6 +255,18 @@ async function resolveRemoteLocation(
 	const remoteCwd = lastNonEmptyLine((await sshOk(profile.remote, remoteCwdCommand)).toString("utf8"));
 	if (!remoteCwd) throw new Error("Could not determine the remote working directory");
 	return { remoteCwd, remoteHome };
+}
+
+function restoreVirtualPathInResult(result: any, corePath: string, originalPath: string): any {
+	if (!corePath.startsWith(`${VIRTUAL_ROOT}/`)) return result;
+	const replace = (value: unknown) => (typeof value === "string" ? value.replaceAll(corePath, originalPath) : value);
+	const content = Array.isArray(result?.content)
+		? result.content.map((block: any) => (block?.type === "text" ? { ...block, text: replace(block.text) } : block))
+		: result?.content;
+	const details = result?.details && typeof result.details === "object"
+		? { ...result.details, diff: replace(result.details.diff), patch: replace(result.details.patch) }
+		: result?.details;
+	return { ...result, content, details };
 }
 
 function createRemoteReadOps(target: ActiveSshTarget, pathMapper: RemotePathMapper): ReadOperations {
@@ -539,9 +551,11 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const pathMapper = createRemotePathMapper(localCwd, target.remoteCwd, target.remoteHome, target.platform);
+			const corePath = pathMapper.toCorePath(params.path);
 			const tool = createWriteToolDefinition(localCwd, { operations: createRemoteWriteOps(target, pathMapper) });
-			const transformedParams = { ...params, path: pathMapper.toCorePath(params.path) };
-			return tool.execute(toolCallId, transformedParams, signal, onUpdate, ctx);
+			const transformedParams = { ...params, path: corePath };
+			const result = await tool.execute(toolCallId, transformedParams, signal, onUpdate, ctx);
+			return restoreVirtualPathInResult(result, corePath, params.path);
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
@@ -569,9 +583,11 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
 			const pathMapper = createRemotePathMapper(localCwd, target.remoteCwd, target.remoteHome, target.platform);
+			const corePath = pathMapper.toCorePath(params.path);
 			const tool = createEditToolDefinition(localCwd, { operations: createRemoteEditOps(target, pathMapper) });
-			const transformedParams = { ...params, path: pathMapper.toCorePath(params.path) };
-			return tool.execute(toolCallId, transformedParams, signal, onUpdate, ctx);
+			const transformedParams = { ...params, path: corePath };
+			const result = await tool.execute(toolCallId, transformedParams, signal, onUpdate, ctx);
+			return restoreVirtualPathInResult(result, corePath, params.path);
 		},
 		renderCall(args, theme) {
 			const path = typeof args?.path === "string" ? args.path : "...";
