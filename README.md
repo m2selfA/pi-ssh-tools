@@ -41,6 +41,20 @@ This package adds `/ssh` for manual use and agent-callable tools for API/non-int
 
 That makes remote work explicit instead of silently swapping out local tools.
 
+## Role with runwatch / pi-runs
+
+For the current Pi-first durable-compute stack, responsibilities are intentionally split:
+
+```text
+pi-ssh-tools  -> Pi-online remote workspace read/write/edit/shell
+pi-runs       -> Pi tools, session/branch binding and continuation UX
+runwatch      -> durable Run/Attempt/Observation/Delivery lifecycle
+```
+
+`pi-ssh-tools` does **not** become a long-lived scheduler watcher, durable Run ledger, or offline continuation service. After a runwatch completion resumes Pi, the model explicitly calls `ssh_activate` for the recorded `host:/cwd` before inspecting scientific outputs. The three projects share only the `RemoteWorkspaceRef { host_alias, cwd }` semantic boundary; they do not share SSH connection objects.
+
+The current release program finishes `runwatch` + `pi-runs` first. Codex/other-agent support is post-v1 design work and must not expand this Pi-specific workspace plugin. See [docs/INTEGRATION_BOUNDARY.md](docs/INTEGRATION_BOUNDARY.md).
+
 ## Agent-callable activation
 
 Use `ssh_activate` before remote work:
