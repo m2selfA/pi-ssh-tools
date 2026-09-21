@@ -1,10 +1,10 @@
 {
   "name": "@hackxit/pi-ssh-tools",
-  "version": "0.1.5-hackxit.2",
+  "version": "0.1.5-hackxit.4",
   "description": "HackXIt standalone derivative of pi-ssh-tools with agent-callable SSH activation.",
   "type": "module",
   "scripts": {
-    "test": "node --test path-mapping.test.mjs ssh-command.test.mjs"
+    "test": "node --test path-mapping.test.mjs ssh-command.test.mjs ssh-tool-state.test.mjs plugin-contract.test.mjs"
   },
   "keywords": [
     "pi-package",
@@ -42,6 +42,10 @@
     "ssh-command.js",
     "ssh-command.d.ts",
     "ssh-command.test.mjs",
+    "ssh-tool-state.js",
+    "ssh-tool-state.test.mjs",
+    "plugin-contract.test.mjs",
+    "docs",
     "README.md",
     "LICENSE",
     "FORK.md"

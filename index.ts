@@ -21,9 +21,12 @@ import {
 	WINDOWS_PLATFORM_MARKER,
 	WINDOWS_PLATFORM_PROBE,
 	WINDOWS_POWERSHELL_COMMAND,
+	createPowerShellRemoteBashScript,
+	createPosixRemoteBashScript,
 	createSshArgs,
 	normalizePowerShellInput,
 } from "./ssh-command.js";
+import { getSshToolState, mergeRegisteredSshTools } from "./ssh-tool-state.js";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 
@@ -57,7 +60,6 @@ type SshExecOptions = {
 };
 
 const SSH_STATUS_KEY = "ssh-tools";
-const SSH_TOOL_NAMES = ["ssh_read", "ssh_write", "ssh_edit", "ssh_bash"] as const;
 const SSH_CONFIG_PATH = join(homedir(), ".ssh", "config");
 
 function shellQuote(value: string): string {
@@ -396,10 +398,9 @@ function createRemoteEditOps(target: ActiveSshTarget, pathMapper: RemotePathMapp
 
 function createRemoteBashOps(target: ActiveSshTarget): BashOperations {
 	return {
-		exec: async (command, cwd, { onData, signal, timeout }) => {
+		exec: async (command, _controllerCwd, { onData, signal, timeout }) => {
 			if (target.platform === "windows-powershell") {
-				const remoteCwd = cwd;
-				const script = `Set-Location -LiteralPath ${powershellQuote(remoteCwd)}\n${command}\nif ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE } else { exit 0 }\n`;
+				const script = createPowerShellRemoteBashScript(target.remoteCwd, command);
 				const { exitCode } = await sshPowerShellExec(target.remote, script, {
 					signal,
 					timeoutSeconds: timeout,
@@ -409,7 +410,7 @@ function createRemoteBashOps(target: ActiveSshTarget): BashOperations {
 				return { exitCode };
 			}
 
-			const script = `cd ${shellQuote(cwd)}\n${command}\n`;
+			const script = createPosixRemoteBashScript(target.remoteCwd, command);
 			const { exitCode } = await sshExec(target.remote, "exec bash -se", {
 				stdin: script,
 				signal,
@@ -422,12 +423,17 @@ function createRemoteBashOps(target: ActiveSshTarget): BashOperations {
 	};
 }
 
-function enableSshTools(pi: ExtensionAPI) {
-	const next = new Set(pi.getActiveTools());
-	for (const name of SSH_TOOL_NAMES) {
-		next.add(name);
+function ensureSshTools(pi: ExtensionAPI) {
+	const allTools = pi.getAllTools();
+	const currentActiveTools = pi.getActiveTools();
+	const nextActiveTools = mergeRegisteredSshTools(allTools, currentActiveTools);
+	const changed =
+		nextActiveTools.length !== currentActiveTools.length ||
+		nextActiveTools.some((name, index) => name !== currentActiveTools[index]);
+	if (changed) {
+		pi.setActiveTools(nextActiveTools);
 	}
-	pi.setActiveTools(Array.from(next));
+	return getSshToolState(allTools, nextActiveTools);
 }
 
 export default function sshToolsExtension(pi: ExtensionAPI) {
@@ -469,7 +475,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			remoteHome: activatedLocation.remoteHome,
 			platform,
 		};
-		enableSshTools(pi);
+		ensureSshTools(pi);
 		updateStatus(ctx);
 		if (notify && ctx.hasUI) {
 			ctx.ui.notify(`SSH mode on: ${activeTarget.name} (${activeTarget.remoteCwd}, ${activeTarget.platform})`, "info");
@@ -491,6 +497,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		remote: activeTarget?.remote,
 		cwd: activeTarget?.remoteCwd,
 		platform: activeTarget?.platform,
+		tools: getSshToolState(pi.getAllTools(), pi.getActiveTools()),
 	});
 
 
@@ -537,10 +544,16 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute() {
 			const details = statusDetails();
-			const text = details.active
+			const toolStatus = [
+				`registered=${details.tools.registered.join(",") || "none"}`,
+				`active=${details.tools.active.join(",") || "none"}`,
+				`missing=${details.tools.missingRegistration.join(",") || "none"}`,
+				`inactive=${details.tools.inactive.join(",") || "none"}`,
+			].join("; ");
+			const modeStatus = details.active
 				? `SSH mode active: ${details.target} (${details.remote}:${details.cwd}, ${details.platform})`
 				: "SSH mode is off";
-			return { content: [{ type: "text", text }], details };
+			return { content: [{ type: "text", text: `${modeStatus}; ${toolStatus}` }], details };
 		},
 		renderCall(_args, theme) {
 			return new Text(theme.fg("toolTitle", theme.bold("ssh_status")), 0, 0);
@@ -654,14 +667,15 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_bash",
 		label: "ssh_bash",
-		description: "Execute a shell command on the active SSH host in the active remote working directory. POSIX targets use bash; Windows PowerShell targets use PowerShell Core syntax.",
+		description: "Execute a shell command on the active SSH host in the active remote working directory. POSIX targets use bash; Windows targets use PowerShell syntax.",
 		promptSnippet: "Execute shell commands on the active SSH host",
 		promptGuidelines: ["Use ssh_bash when the command must run on the active SSH host rather than locally. Use PowerShell syntax when ssh_status reports platform windows-powershell."],
 		parameters: bashBase.parameters,
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, _ctx) {
 			const target = requireActiveTarget();
 			const tool = createBashToolDefinition(target.remoteCwd, { operations: createRemoteBashOps(target) });
-			return tool.execute(toolCallId, params, signal, onUpdate, ctx);
+			// Do not forward Pi's context: Pi 0.86.x prefers ctx.cwd over the definition cwd.
+			return tool.execute(toolCallId, params, signal, onUpdate);
 		},
 		renderCall(args, theme, context) {
 			const command = typeof args?.command === "string" ? args.command : "...";
@@ -688,11 +702,12 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			const profiles = refreshProfiles();
 
 			if (input === "status") {
-				if (!activeTarget) {
-					ctx.ui.notify("SSH mode is off", "info");
-					return;
-				}
-				ctx.ui.notify(`SSH mode: ${activeTarget.name} (${activeTarget.remote}:${activeTarget.remoteCwd})`, "info");
+				const details = statusDetails();
+				const modeStatus = details.active
+					? `SSH mode: ${details.target} (${details.remote}:${details.cwd}, ${details.platform})`
+					: "SSH mode is off";
+				const toolStatus = `tools registered=${details.tools.registered.join(",") || "none"}; active=${details.tools.active.join(",") || "none"}; missing=${details.tools.missingRegistration.join(",") || "none"}; inactive=${details.tools.inactive.join(",") || "none"}`;
+				ctx.ui.notify(`${modeStatus}; ${toolStatus}`, "info");
 				return;
 			}
 
@@ -729,21 +744,56 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		activeTarget = null;
-		enableSshTools(pi);
+		ensureSshTools(pi);
 		updateStatus(ctx);
 	});
 
-	pi.on("before_agent_start", async (event) => {
-		if (!activeTarget) {
+	pi.on("session_tree", () => {
+		ensureSshTools(pi);
+	});
+
+	const buildSshPromptSection = (
+		target: ActiveSshTarget,
+		toolState: { missingRegistration: string[]; inactive: string[] },
+	) => {
+		const shellGuidance =
+			target.platform === "windows-powershell"
+				? "ssh_bash runs in Windows PowerShell on this target; use PowerShell syntax unless explicitly invoking cmd.exe or another shell."
+				: "ssh_bash runs through bash on this target.";
+		const registrationWarning =
+			toolState.missingRegistration.length > 0
+				? `SSH tool registration is incomplete; missing: ${toolState.missingRegistration.join(", ")}. Do not substitute local tools; reload the extension.`
+				: toolState.inactive.length > 0
+					? `SSH tools are registered but inactive: ${toolState.inactive.join(", ")}. Check the Pi tool allowlist or another tool preset before using remote work.`
+					: undefined;
+		return [
+			"SSH mode is active for this turn.",
+			`Remote host: ${target.remote}`,
+			`Remote platform: ${target.platform}`,
+			`Remote working directory: ${target.remoteCwd}`,
+			shellGuidance,
+			"Use ssh_read, ssh_write, ssh_edit, and ssh_bash for remote work. Local read/write/edit/bash still operate on the local machine.",
+			registrationWarning,
+		].filter(Boolean).join("\n");
+	};
+
+	pi.on("before_agent_start", (event) => {
+		const toolState = ensureSshTools(pi);
+		const sections = event.systemPromptOptions?.sections;
+		if (sections) {
+			if (activeTarget) {
+				sections.ssh_mode = buildSshPromptSection(activeTarget, toolState);
+			} else {
+				delete sections.ssh_mode;
+			}
 			return;
 		}
-		const shellGuidance = activeTarget.platform === "windows-powershell"
-			? "ssh_bash runs in PowerShell Core on this target; use PowerShell syntax unless explicitly invoking cmd.exe or another shell."
-			: "ssh_bash runs through bash on this target."
-		return {
-			systemPrompt:
-				event.systemPrompt +
-				`\n\nSSH mode is active for this turn.\nRemote host: ${activeTarget.remote}\nRemote platform: ${activeTarget.platform}\nRemote working directory: ${activeTarget.remoteCwd}\n${shellGuidance}\nUse ssh_read, ssh_write, ssh_edit, and ssh_bash for remote work. Local read/write/edit/bash still operate on the local machine.`,
-		};
+
+		// Keep compatibility with older Pi releases that do not expose structured prompt sections.
+		if (activeTarget) {
+			return {
+				systemPrompt: `${event.systemPrompt}\n\n${buildSshPromptSection(activeTarget, toolState)}`,
+			};
+		}
 	});
 }

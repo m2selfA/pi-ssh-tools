@@ -4,3 +4,5 @@ export declare const WINDOWS_POWERSHELL_COMMAND: string;
 
 export declare function createSshArgs(remote: string, command: string): string[];
 export declare function normalizePowerShellInput(script: string): string;
+export declare function createPosixRemoteBashScript(remoteCwd: string, command: string): string;
+export declare function createPowerShellRemoteBashScript(remoteCwd: string, command: string): string;

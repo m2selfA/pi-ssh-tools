@@ -9,3 +9,19 @@ export function createSshArgs(remote, command) {
 export function normalizePowerShellInput(script) {
 	return script.endsWith("\n") ? script : `${script}\n`;
 }
+
+function shellQuote(value) {
+	return `'${value.replaceAll("'", `\'"\'"\'`)}'`;
+}
+
+function powershellQuote(value) {
+	return `'${value.replaceAll("'", "''")}'`;
+}
+
+export function createPosixRemoteBashScript(remoteCwd, command) {
+	return `cd ${shellQuote(remoteCwd)}\n${command}\n`;
+}
+
+export function createPowerShellRemoteBashScript(remoteCwd, command) {
+	return `Set-Location -LiteralPath ${powershellQuote(remoteCwd)}\n${command}\nif ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE } else { exit 0 }\n`;
+}

@@ -37,7 +37,7 @@ This package adds `/ssh` for manual use and agent-callable tools for API/non-int
 - No persistence across sessions
 - Local `read`, `write`, `edit`, and `bash` stay local
 - When SSH mode is active, the agent also gets `ssh_read`, `ssh_write`, `ssh_edit`, and `ssh_bash`
-- The active remote host and cwd are injected into the system prompt while SSH mode is on
+- The active remote host and cwd are injected into the system prompt while SSH mode is on. Remote bash always uses the detected remote cwd; the controller's local Windows cwd is never sent to a POSIX target.
 
 That makes remote work explicit instead of silently swapping out local tools.
 
@@ -74,7 +74,7 @@ user@host:/remote/path
 
 Then call:
 
-- `ssh_status` to inspect active state, including the detected remote platform
+- `ssh_status` to inspect active state, detected remote platform, and SSH tool registration/active-loadout diagnostics. If tools are registered but inactive, check Pi's `--tools`/`--exclude-tools` allowlist or another tool preset.
 - `ssh_deactivate` to turn SSH mode off
 - `ssh_read`, `ssh_write`, `ssh_edit`, and `ssh_bash` for remote work
 
@@ -134,14 +134,18 @@ This is mainly a convenience layer. SSH config is not required for the actual re
 - image reads are supported for common extensions: jpg, jpeg, png, gif, webp
 - `ssh_bash` renders the target and the exact command in the TUI; on POSIX targets command text is bash-highlighted, and on Windows targets the command still renders in the same compact shell block while the prompt/system guidance tells agents to use PowerShell syntax
 
+## Pi package compatibility
+
+The package follows Pi's package contract: `package.json` declares `./index.ts` under `pi.extensions`, Pi core modules remain peer dependencies, and the extension is tested with Pi 0.86.1's loader. No Pi core package is bundled into this package.
+
 ## Development
 
-Run the path-mapping regression tests with:
+Run the regression and package-contract tests with:
 
 ```bash
 npm test
 ```
 
-The tests cover Windows-to-POSIX absolute paths, relative paths, traversal, remote home expansion, virtual-path collisions, and Windows PowerShell targets.
+The tests cover Windows-to-POSIX absolute paths, relative paths, traversal, remote home expansion, virtual-path collisions, Windows PowerShell targets, package metadata, and (when `pi` is installed) loading through Pi's RPC startup path.
 
 
