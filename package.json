@@ -4,7 +4,7 @@
   "description": "HackXIt standalone derivative of pi-ssh-tools with agent-callable SSH activation.",
   "type": "module",
   "scripts": {
-    "test": "node --test path-mapping.test.mjs ssh-command.test.mjs ssh-tool-state.test.mjs plugin-contract.test.mjs"
+    "test": "node --test path-mapping.test.mjs ssh-command.test.mjs ssh-tool-state.test.mjs ssh-target-policy.test.mjs plugin-contract.test.mjs"
   },
   "keywords": [
     "pi-package",
@@ -44,6 +44,8 @@
     "ssh-command.test.mjs",
     "ssh-tool-state.js",
     "ssh-tool-state.test.mjs",
+    "ssh-target-policy.js",
+    "ssh-target-policy.test.mjs",
     "plugin-contract.test.mjs",
     "docs",
     "README.md",

@@ -27,12 +27,14 @@ import {
 	normalizePowerShellInput,
 } from "./ssh-command.js";
 import { getSshToolState, mergeRegisteredSshTools } from "./ssh-tool-state.js";
+import { assertSshTargetAllowed } from "./ssh-target-policy.js";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 
 type SshProfile = {
 	name: string;
 	remote: string;
+	hostName?: string;
 	cwd?: string;
 };
 
@@ -81,26 +83,43 @@ function parseSshConfigProfiles(): SshProfile[] {
 
 	const text = readFileSync(SSH_CONFIG_PATH, "utf8");
 	const profiles = new Map<string, SshProfile>();
+	let activeAliases: string[] = [];
+	let configuredHostName: string | undefined;
+
+	const flushBlock = () => {
+		for (const alias of activeAliases) {
+			if (!profiles.has(alias)) {
+				profiles.set(alias, {
+					name: alias,
+					remote: alias,
+					...(configuredHostName ? { hostName: configuredHostName } : {}),
+				});
+			}
+		}
+	};
 
 	for (const rawLine of text.split("\n")) {
 		const withoutComment = rawLine.replace(/\s+#.*$/, "").trim();
 		if (!withoutComment) continue;
 
-		const match = withoutComment.match(/^Host\s+(.+)$/i);
-		if (!match) continue;
+		const hostMatch = withoutComment.match(/^Host\s+(.+)$/i);
+		if (hostMatch) {
+			flushBlock();
+			activeAliases = hostMatch[1]
+				.split(/\s+/)
+				.map((alias) => alias.trim())
+				.filter(Boolean)
+				.filter((alias) => !alias.includes("*") && !alias.includes("?") && !alias.startsWith("!"));
+			configuredHostName = undefined;
+			continue;
+		}
 
-		const aliases = match[1]
-			.split(/\s+/)
-			.map((alias) => alias.trim())
-			.filter(Boolean)
-			.filter((alias) => !alias.includes("*") && !alias.includes("?") && !alias.startsWith("!"));
-
-		for (const alias of aliases) {
-			if (!profiles.has(alias)) {
-				profiles.set(alias, { name: alias, remote: alias });
-			}
+		const hostNameMatch = withoutComment.match(/^HostName\s+(.+)$/i);
+		if (hostNameMatch && activeAliases.length > 0) {
+			configuredHostName = hostNameMatch[1].trim();
 		}
 	}
+	flushBlock();
 
 	return Array.from(profiles.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -465,7 +484,16 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		);
 	};
 
-	const activate = async (profile: SshProfile, ctx: ExtensionContext | ExtensionCommandContext, notify = true) => {
+	const activate = async (
+		profile: SshProfile,
+		ctx: ExtensionContext | ExtensionCommandContext,
+		notify = true,
+		options: { allowLocalTarget?: boolean } = {},
+	) => {
+		assertSshTargetAllowed(profile.remote, {
+			resolvedHost: profile.hostName,
+			allowLocalTarget: options.allowLocalTarget,
+		});
 		const platform = await detectRemotePlatform(profile.remote);
 		const activatedLocation = await resolveRemoteLocation(profile, platform);
 		activeTarget = {
@@ -504,11 +532,16 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_activate",
 		label: "ssh_activate",
-		description: "Activate SSH mode for a target using the same syntax as /ssh <host>[:path].",
-		promptSnippet: "Activate the remote SSH toolset for a target host",
-		promptGuidelines: ["Call ssh_activate with an explicit target before using ssh_read, ssh_write, ssh_edit, or ssh_bash."],
+		description: "Activate SSH mode for a non-local target using the same syntax as /ssh <host>[:path]. Localhost/loopback/current-machine targets are refused by default; use native local tools for local work.",
+		promptSnippet: "Activate the remote SSH toolset for a non-local target",
+		promptGuidelines: [
+			"Call ssh_activate only for a real remote host before using ssh_read, ssh_write, ssh_edit, or ssh_bash.",
+			"For this machine use the native read/write/edit/bash tools (and powershell where available), not SSH.",
+			"ssh_activate refuses localhost, loopback addresses, and the controller hostname unless allowLocalTarget=true is explicitly supplied for an intentional SSH self-test.",
+		],
 		parameters: Type.Object({
 			target: Type.Optional(Type.String({ description: "SSH target using /ssh syntax, for example host or user@host:/path" })),
+			allowLocalTarget: Type.Optional(Type.Boolean({ description: "Explicitly opt into an intentional SSH loopback/self-host test; never set this for ordinary local work." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const profiles = refreshProfiles();
@@ -525,7 +558,9 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 				target = picked;
 			}
 
-			const activated = await activate(normalizeTargetArg(target, profiles), ctx);
+			const activated = await activate(normalizeTargetArg(target, profiles), ctx, true, {
+				allowLocalTarget: params.allowLocalTarget === true,
+			});
 			return {
 				content: [{ type: "text", text: `SSH mode on: ${activated.name} (${activated.remote}:${activated.remoteCwd}, ${activated.platform})` }],
 				details: statusDetails(),
@@ -609,7 +644,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		label: "ssh_write",
 		description: "Write a text file on the active SSH host. Relative paths are resolved against the active remote working directory.",
 		promptSnippet: "Create or overwrite files on the active SSH host",
-		promptGuidelines: ["Use ssh_write only for new files or full rewrites on the active SSH host."],
+		promptGuidelines: ["Use ssh_write only for new files or full rewrites on the active non-local SSH host; use native write for controller-local files."],
 		parameters: writeBase.parameters,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const target = requireActiveTarget();
@@ -638,7 +673,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 		description: "Edit a file on the active SSH host using exact text replacement. Relative paths are resolved against the active remote working directory.",
 		promptSnippet: "Make precise file edits on the active SSH host",
 		promptGuidelines: [
-			"Use ssh_edit for precise remote changes.",
+			"Use ssh_edit only for precise changes on the active non-local SSH host; use native edit for controller-local files.",
 			"Each edits[].oldText must match exactly on the remote file.",
 		],
 		parameters: editBase.parameters,
@@ -772,7 +807,7 @@ export default function sshToolsExtension(pi: ExtensionAPI) {
 			`Remote platform: ${target.platform}`,
 			`Remote working directory: ${target.remoteCwd}`,
 			shellGuidance,
-			"Use ssh_read, ssh_write, ssh_edit, and ssh_bash for remote work. Local read/write/edit/bash still operate on the local machine.",
+			"Use ssh_read, ssh_write, ssh_edit, and ssh_bash only for this active non-local SSH host. For controller-local work use native read/write/edit/bash (and powershell where available); do not switch to SSH for localhost, loopback, or the controller hostname.",
 			registrationWarning,
 		].filter(Boolean).join("\n");
 	};

@@ -63,6 +63,14 @@ Use `ssh_activate` before remote work:
 { "target": "mac:/Users/me/project" }
 ```
 
+`ssh_activate` is for real remote work only. It refuses `localhost`, loopback addresses (`127.0.0.0/8`, `::1`), and the controller machine's hostname so the agent does not replace local tools with a needless SSH hop. For local files or commands, use Pi's native `read`, `write`, `edit`, `bash` (and `powershell` where available) tools. An intentional SSH self-test must be explicit:
+
+```json
+{ "target": "localhost:/tmp/ssh-test", "allowLocalTarget": true }
+```
+
+The `allowLocalTarget` override is only for testing SSH against the controller itself; do not use it for ordinary local work.
+
 The `target` syntax matches `/ssh <host>[:path]`:
 
 ```text
@@ -107,7 +115,7 @@ That means the package still works even if you do not use `~/.ssh/config`.
 The picker reads `Host ...` aliases from your local `~/.ssh/config`.
 
 - wildcard entries like `Host *` are ignored
-- aliases are used as the SSH target directly
+- aliases are used as the SSH target directly; configured `HostName localhost`/loopback aliases are refused by default too
 - if no remote path is provided, the extension resolves it with a platform-specific SSH probe (`pwd` on POSIX or PowerShell `Get-Location` on Windows)
 
 This is mainly a convenience layer. SSH config is not required for the actual remote tools.
@@ -122,6 +130,7 @@ This is mainly a convenience layer. SSH config is not required for the actual re
 
 ## Notes
 
+- `ssh_activate` enforces a runtime local-target guard before any SSH probe; refusal messages route the agent back to native local tools and identify `allowLocalTarget=true` as the intentional self-test override
 - `ssh_activate` probes the remote command shell and records `platform: posix` or `platform: windows-powershell`; Windows detection uses `cmd.exe`/explicit PowerShell probes instead of running POSIX utilities first
 - Programmatic SSH calls disable X11 forwarding, so a local `ForwardX11 yes` setting does not break non-GUI remote commands
 - POSIX targets keep the historical `bash`/`cat`/`test`/`mkdir` backend
